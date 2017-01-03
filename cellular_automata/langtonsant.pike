@@ -1,3 +1,5 @@
+#!/usr/bin/env pike
+
 /*
 Rules: https://secure.wikimedia.org/wikipedia/en/wiki/Langton%27s_ant
 

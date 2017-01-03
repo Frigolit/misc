@@ -1,3 +1,5 @@
+#!/usr/bin/env pike
+
 /*
 RGB565 Image Converter
 
