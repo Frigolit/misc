@@ -1,0 +1,38 @@
+#!/usr/bin/env pike
+
+int main(int argc, array(string) argv) {
+	int f_quiet = Getopt.find_option(argv, "q", "quiet");
+
+	array files = Getopt.get_args(argv)[1..];
+
+	foreach (files, string n) {
+		mixed err = catch {
+			Stdio.Stat s = file_stat(n, 1);
+
+			if (s->isreg) {
+				string h = "";
+				Stdio.File f = Stdio.File(n, "r");
+
+				for (int i = 0; i < 16; i++) {
+					string d = f->read(16 * (i + 1));
+					h += Crypto.MD5.hash(d)[0..1];
+				}
+
+				f->close();
+
+				write("%s    %s\n", String.string2hex(h), n);
+			}
+			else {
+				if (!f_quiet) {
+					werror("%s: Error: Type is %s\n", n, s->type);
+				}
+			}
+		};
+
+		if (err) {
+			if (!f_quiet) {
+				werror("%s: Error: %s\n", n, strerror(errno()));
+			}
+		}
+	}
+}
