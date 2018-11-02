@@ -1,0 +1,236 @@
+#!/usr/bin/env pike
+
+int main() {
+	// Default progress bar colour bands
+	array progbar_colours = ({
+		33,
+		({ 3, 4, 46 }),
+		({ 5, 8, 226 }),
+		({ 9, 11, 208 }),
+		({ 12, 13, 196 }),
+		({ 14, 15, 165 })
+	});
+
+	// Main loop
+	while (true) {
+		// Get the data
+		array temp_sensors = get_temperature_sensors();
+		array drives = get_drives();
+
+		// Do some minor prep work on it
+		sort(temp_sensors->label, temp_sensors);
+
+		// Generate output string
+		string res = "";
+
+		if (sizeof(temp_sensors)) {
+			// We've got temperature sensors!
+			res += "\e[1m=== Temperature sensors ===\e[0m\n";
+
+			foreach (temp_sensors, mapping m) {
+				string pb = make_progbar(m->value / 100.0, 16, "\u25ae", " ", progbar_colours);
+
+				res += sprintf("%-16s %6.1f C  (%s)\n", m->label || "", m->value, pb);
+			}
+
+			res += "\n";
+		}
+
+		if (sizeof(drives)) {
+			// We've got harddrives!
+			res += "\e[1m=== Harddrives ===\e[0m\n";
+
+			foreach (drives, mapping m) {
+				res += sprintf("(%s) %-20s ", m->device, m->model[0..19]);
+
+				if (m->state == "active") {
+					res += "\e[32;1m\u23f5";
+				}
+				else if (m->state == "standby") {
+					res += "\e[34;1m\u23fb";
+				}
+				else {
+					res += "\e[37m?";
+				}
+				res += "\e[0m ";
+
+				if (!undefinedp(m->temperature)) {
+					res += sprintf("%3d C", m->temperature);
+					res += " (";
+					res += make_progbar(m->temperature / 60.0, 16, "\u25ae", " ", progbar_colours);
+					res += ")";
+				}
+
+				res += "\n";
+			}
+		}
+
+		// Clear screen
+		cls();
+
+		// UTF-8 encode and write output to terminal
+		write(string_to_utf8(String.trim_all_whites(res)));
+
+		// Next run in 5 seconds (TODO: make this configurable)
+		sleep(5);
+	}
+}
+
+// Clears the screen and resets the cursor to the top-left corner.
+void cls() {
+	write("\e[2J\e[1;1H");
+}
+
+// Returns an array of temperature sensors and their current values.
+array(mapping) get_temperature_sensors() {
+	array r = ({ });
+	array a = filter(get_dir("/sys/class/hwmon"), Function.curry(glob)("hwmon*"));
+
+	foreach (a, string b) {
+		string hwmon_path = "/sys/class/hwmon/" + b;
+
+		array c = filter(get_dir(hwmon_path), Function.curry(glob)("temp*_input"));
+
+		foreach (c, string d) {
+			string sensor_name = (d / "_")[0];
+			string sensor_basepath = combine_path(hwmon_path, sensor_name);
+			string sensor_id = b + ":" + sensor_name;
+
+			string sensor_label;
+
+			if (Stdio.is_file(sensor_basepath + "_label")) {
+				sensor_label = String.trim_all_whites(Stdio.read_file(sensor_basepath + "_label"));
+			}
+
+			float sensor_value = ((int)Stdio.read_file(sensor_basepath + "_input")) / 1000.0;
+
+			r += ({
+				([
+					"id": sensor_id,
+					"name": sensor_name,
+					"path": sensor_basepath,
+					"label": sensor_label,
+					"value": sensor_value,
+				])
+			});
+		}
+	}
+
+	return r;
+}
+
+// Returns an array of harddrives and their current power state and temperature in Celsius (temperature or airflow temperature).
+array(mapping) get_drives() {
+	if (!Process.search_path("smartctl")) {
+		// No "smartctl" command? No drives for you!
+		return ({ });
+	}
+
+	array r = ({ });
+
+	// Process drives
+	foreach (sort(get_dir("/sys/block")), string b) {
+		string p_block = combine_path("/sys/block", b);
+		string p_dev = combine_path(p_block, "device");
+
+		if (!Stdio.is_dir(combine_path(p_dev, "scsi_disk"))) {
+			continue;
+		}
+
+		string dev_model = String.trim_all_whites(Stdio.read_file(combine_path(p_dev, "model")) || "");
+
+		string power_state = "unknown";
+
+		array smartdata = (Process.run("smartctl -i -n standby /dev/" + b)->stdout / "\n") - ({ "" });
+		foreach (smartdata, string c) {
+			c = String.trim_all_whites(c);
+			if (c == "") { continue; }
+
+			if (glob("Device is in STANDBY*", c)) {
+				power_state = "standby";
+			}
+			else if (glob("Power mode is:*", c)) {
+				string d = String.trim_all_whites((c / ":")[1]);
+
+				power_state = lower_case((d / " ")[0]);
+			}
+		}
+
+		mapping drive = ([
+			"device": b,
+			"model": dev_model,
+			"state": power_state,
+		]);
+
+		bool reading_attribs = false;
+
+		array smartattribs = (Process.run("smartctl -A /dev/" + b)->stdout / "\n") - ({ "" });
+		foreach (smartattribs, string c) {
+			c = String.trim_all_whites(c);
+			if (c == "") { continue; }
+
+			if (reading_attribs) {
+				array d = (replace(c, "\t", " ") / " ") - ({ "" });
+
+				int attrib_id = (int)d[0];
+				int value = (int)d[9];
+
+				if (attrib_id == 190 || attrib_id == 194) {
+					drive->temperature = value;
+				}
+			}
+			else if (c[0..3] == "ID# ") {
+				reading_attribs = true;
+			}
+		}
+
+		r += ({ drive });
+	}
+
+	return r;
+}
+
+// Generates a progress bar with specified length, lit/dim characters and optionally colour bands.
+string make_progbar(float value, int size, string char_lit, string char_dim, array|void colours) {
+	// Clamp input value
+	if (value < 0.0) { value = 0.0; }
+	else if (value > 1.0) { value = 1.0; }
+
+	// Lit steps
+	int n = (int)(value * size);
+
+	if (colours) {
+		// We're using colours - Go through the colours and map them up by char index.
+		mapping colour_map = ([ ]);
+
+		int default_colour = colours[0];
+
+		foreach (colours[1..], array(int) a) {
+			for (int i = a[0]; i <= a[1]; i++) {
+				colour_map[i] = a[2];
+			}
+		}
+
+		// Generate the string
+		string res = "";
+		int last_colour = -1;
+
+		for (int i = 0; i < size; i++) {
+			string char = (i <= n) ? char_lit : char_dim;
+			int colour = colour_map[i] || default_colour;
+
+			if (colour != last_colour) {
+				res += "\e[38;5;" + colour + "m";
+				last_colour = colour;
+			}
+
+			res += char;
+		}
+
+		return res + "\e[0m";
+	}
+	else {
+		// We haven't specified any colours, so this is easy
+		return (char_lit * n) + (char_dim * (size - n));
+	}
+}
