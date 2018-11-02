@@ -91,8 +91,8 @@ int main(int argc, array argv) {
 				string uv_left_log = build_log_uv(tppm_left);
 				string uv_left_ilog = build_ilog_uv(tppm_left);
 
-				string p_left_str = "\u25aa" * p_left;
-				//string pwr_left = "\u25aa" * (int)(8 * ((float)power_left / 65536.0));
+				string p_left_str = "\u25a0" * p_left;
+				//string pwr_left = "\u25a0" * (int)(8 * ((float)power_left / 65536.0));
 				string pwr_left = build_log_uv(power_left);
 
 				write(string_to_utf8(sprintf("%6.1fdB [\e[32m%-20s\e[31m%-10s\e[37m] [\e[32m%-8s\e[37m] [\e[32m%-8s\e[37m] [\e[32m%-8s\e[37m]\n", db_left, p_left_str[0..19], p_left_str[20..29], pwr_left, uv_left_log, uv_left_ilog)));
@@ -105,8 +105,8 @@ int main(int argc, array argv) {
 				string uv_right_log = build_log_uv(tppm_right);
 				string uv_right_ilog = build_ilog_uv(tppm_right);
 
-				string p_right_str = "\u25aa" * p_right;
-				//string pwr_right = "\u25aa" * (int)(8 * ((float)power_right / 65536.0));
+				string p_right_str = "\u25a0" * p_right;
+				//string pwr_right = "\u25a0" * (int)(8 * ((float)power_right / 65536.0));
 				string pwr_right = build_log_uv(power_right);
 
 				write(string_to_utf8(sprintf("%6.1fdB [\e[32m%-20s\e[31m%-10s\e[37m] [\e[32m%-8s\e[37m] [\e[32m%-8s\e[37m] [\e[32m%-8s\e[37m]\n", db_right, p_right_str[0..19], p_right_str[20..29], pwr_right, uv_right_log, uv_right_ilog)));
@@ -120,7 +120,7 @@ int main(int argc, array argv) {
 }
 
 string build_log_uv(int v) {
-	string c = "\u25aa";
+	string c = "\u25a0";
 	string uv = "";
 	if (v >=   655) uv += c;
 	if (v >=  4134) uv += c;
@@ -134,7 +134,7 @@ string build_log_uv(int v) {
 }
 
 string build_ilog_uv(int v) {
-	string c = "\u25aa";
+	string c = "\u25a0";
 	string uv = "";
 	if (v >= 16384) uv += c;
 	if (v >= 32768) uv += c;
