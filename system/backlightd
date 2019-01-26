@@ -1,0 +1,340 @@
+#!/usr/bin/env pike
+
+// ==================================================================
+// Laptop backlight auto-adjuster
+// Copyright (C) 2019 Frigolit.net - https://frigolit.net/
+// Licensed under the MIT license - See LICENSE for more information.
+// ==================================================================
+// This program monitors the laptop's lid switch, AC adapter and
+// battery charge and adjusts the backlight accordingly.
+//
+// If a webcam is available it'll take a couple of snapshots to
+// determine the current light level in the room and uses that as a
+// base when setting the brightness.
+// ==================================================================
+
+#define EV_SW 0x05
+
+string backlight_path;
+
+string lid_input;
+bool lid_closed = false;
+
+string ac_power;
+string battery;
+
+bool camera_update_queued = false;
+bool camera_update_running = false;
+
+Thread.Mutex mtx = Thread.Mutex();
+
+int refresh_count = 0;
+
+float target_brightness;
+
+string webcam_path;
+
+float brightness_adjust = 1.0;
+float max_brightness_cap = 0.9;
+float min_brightness_cap = 0.05;
+
+int main(int argc, array argv) {
+	int f_help = Getopt.find_option(argv, "h", "help");
+	int f_nofork = Getopt.find_option(argv, "f", "foreground");
+	int f_noac = Getopt.find_option(argv, "", "no-ac");
+	int f_nobattery = Getopt.find_option(argv, "", "no-battery");
+	int f_nowebcam = Getopt.find_option(argv, "", "no-camera");
+
+	string f_camera = Getopt.find_option(argv, "c", "camera", UNDEFINED, "");
+
+	// Usage information
+	if (f_help) {
+		write("Laptop backlight auto-adjuster\n");
+		write("Copyright (C) 2019 Frigolit.net - https://frigolit.net/\n");
+		write("\n");
+
+		write("Usage: %s [options]\n", basename(argv[0]));
+		write("\n");
+
+		write("-h|--help             Shows this help screen.\n");
+		write("-f|--foreground       Don't fork to background.\n");
+		write("-c|--camera <path>    Path to the camera video device (e.g. /dev/video0).\n");
+		write("   --no-ac            Don't monitor AC adapter state.\n");
+		write("   --no-battery       Don't monitor battery level.\n");
+		write("   --no-camera        Don't use a webcam to determine light levels.\n");
+		write("\n");
+
+		write("When detecting a webcam, it sorts the V4L devices in '/dev/v4l/by-id' based on\n");
+		write("if the term 'webcam' exists in the name or not, to help ensure that a webcam is\n");
+		write("picked in case more video devices are available.\n");
+		return 0;
+	}
+
+	// Find backlight
+	foreach (get_dir("/sys/class/backlight"), string b) {
+		backlight_path = combine_path("/sys/class/backlight", b);
+	}
+
+	if (!backlight_path) {
+		werror("ERROR: Couldn't find backlight in \"/sys/class/backlight\".\n");
+		return 1;
+	}
+
+	// Find camera
+	if (!f_nowebcam) {
+		if (f_camera != "") {
+			webcam_path = f_camera;
+		}
+		else {
+			if (Stdio.is_dir("/dev/v4l/by-id")) {
+				array a = sort(get_dir("/dev/v4l/by-id"));
+
+				if (sizeof(a)) {
+					sort(
+						map(
+							a,
+							lambda(string n) {
+								return !glob("*webcam*", lower_case(n));
+							}
+						),
+						a
+					);
+
+					webcam_path = "/dev/v4l/by-id/" + a[0];
+				}
+			}
+		}
+	}
+
+	// Find lid switch input
+	if (Stdio.is_dir("/sys/class/input")) {
+		foreach (get_dir("/sys/class/input"), string b) {
+			string p = combine_path("/sys/class/input", b, "name");
+
+			if (Stdio.is_file(p)) {
+				string n = String.trim_all_whites(Stdio.read_file(p));
+				if (n == "Lid Switch") {
+					array evs = filter(get_dir(dirname(p)), Function.curry(glob)("event*"));
+					if (sizeof(evs) >= 1) {
+						lid_input = evs[0];
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	// Find AC input
+	if (Stdio.is_dir("/sys/class/power_supply")) {
+		foreach (get_dir("/sys/class/power_supply"), string b) {
+			if (glob("AC*", b) && !f_noac) {
+				ac_power = b;
+			}
+			else if (glob("BAT*", b) && !f_nobattery) {
+				battery = b;
+			}
+		}
+	}
+
+	// Should be fork to background?
+	if (!f_nofork && fork()) {
+		return 0;
+	}
+
+	if (f_nofork) {
+		write("Backlight:  %s\n", backlight_path);
+		write("Lid switch: %s\n", lid_input || "(none)");
+		write("AC power:   %s\n", ac_power || "(none)");
+		write("Battery:    %s\n", battery || "(none)");
+		write("Webcam:     %s\n", webcam_path || "(none)");
+		write("\n");
+	}
+
+	if (lid_input && webcam_path) {
+		Thread.Thread(lid_switch_thread);
+	}
+
+	if (ac_power) {
+		Thread.Thread(ac_power_thread);
+	}
+
+	Thread.Thread(brightness_thread);
+
+	if (webcam_path) {
+		queue_camera_update(1);
+	}
+
+	return -1;
+}
+
+void update_camera() {
+	object k = mtx->lock(1);
+	camera_update_queued = false;
+
+	if (camera_update_running) {
+		return;
+	}
+	camera_update_running = true;
+	destruct(k);
+
+	Thread.Thread(camera_update_thread);
+}
+
+void camera_update_thread() {
+	if (Stdio.is_dir("/tmp/backlightd")) {
+		Stdio.recursive_rm("/tmp/backlightd");
+	}
+
+	Stdio.mkdirhier("/tmp/backlightd");
+	mapping m = Process.run("ffmpeg -f video4linux2 -i " + webcam_path + " -vframes 10 /tmp/backlightd/%3d.jpg");
+
+	string fn = combine_path("/tmp/backlightd", sort(get_dir("/tmp/backlightd"))[-1]);
+
+	Image.Image img = Image.JPEG.decode(Stdio.read_file(fn));
+	array avgs = img->average();
+	destruct(img);
+
+	Stdio.recursive_rm("/tmp/backlightd");
+
+	float avg = ((avgs[0] / 255.0) + (avgs[1] / 255.0) + (avgs[2] / 255.0)) / 3.0;
+	target_brightness = avg;
+
+	object k = mtx->lock(1);
+	camera_update_running = false;
+	if (lid_input) {
+		if (!lid_closed && refresh_count < 5) {
+			queue_camera_update(pow(++refresh_count, 2));
+		}
+	}
+	else {
+		// We don't have a lid switch, just update again in 1 min
+		queue_camera_update(60);
+	}
+	destruct(k);
+}
+
+void brightness_thread() {
+	int max_brightness = (int)String.trim_all_whites(Stdio.read_file(combine_path(backlight_path, "max_brightness")));
+	target_brightness = 1.0;
+	int cur_brightness = max_brightness;
+
+	while (true) {
+		float t = target_brightness * brightness_adjust;
+
+		if (t > max_brightness_cap) { t = max_brightness_cap; }
+		else if (t < min_brightness_cap) { t = min_brightness_cap; }
+
+		int tn = (int)(t * max_brightness);
+
+		if (tn != cur_brightness) {
+			int x = cur_brightness + (int)((tn - cur_brightness) / 1.6);
+			if (abs(tn - cur_brightness) == 1) {
+				x = tn;
+			}
+
+			Stdio.write_file(combine_path(backlight_path, "brightness"), (string)x + "\n");
+			cur_brightness = x;
+
+			sleep(1.0 / 15.0);
+		}
+		else {
+			sleep(1.5);
+		}
+	}
+}
+
+void queue_camera_update(int|void tm) {
+	if (!webcam_path || camera_update_queued) {
+		return;
+	}
+
+	call_out(update_camera, tm || 1);
+	camera_update_queued = true;
+}
+
+void cancel_camera_update() {
+	if (!camera_update_queued) {
+		return;
+	}
+
+	remove_call_out(update_camera);
+	camera_update_queued = false;
+}
+
+void lid_switch_thread() {
+	Stdio.File f = Stdio.File("/dev/input/" + lid_input, "r");
+	string d;
+
+	multiset active_switches = (< >);
+
+	while (d = f->read(24)) {
+		if (!d || d == "") {
+			break;
+		}
+
+		bool redraw = false;
+
+		int m_type = (d[17] << 8) | d[16];
+		int m_code = (d[19] << 8) | d[18];
+		int m_value;
+
+		sscanf(d[20..23], "%+-4c", m_value);
+
+		if (m_type == EV_SW) {
+			object k = mtx->lock(1);
+			if (m_value > 0 && !lid_closed) {
+				lid_closed = true;
+				cancel_camera_update();
+			}
+			else if (m_value == 0 && lid_closed) {
+				lid_closed = false;
+				refresh_count = 0;
+				queue_camera_update();
+			}
+			destruct(k);
+		}
+	}
+}
+
+void ac_power_thread() {
+	int last_state = 1;
+
+	while (true) {
+		int plugged_in = (int)Stdio.read_file("/sys/class/power_supply/" + ac_power + "/online");
+
+		if (plugged_in != last_state) {
+			last_state = plugged_in;
+
+			object k = mtx->lock(1);
+			if (plugged_in) {
+				max_brightness_cap = 1.0;
+				brightness_adjust = 1.0;
+			}
+			else {
+				max_brightness_cap = 0.6;
+				brightness_adjust = 0.5;
+			}
+			destruct(k);
+
+			queue_camera_update();
+		}
+
+		if (!plugged_in && battery) {
+			int bat_charge = (int)Stdio.read_file(combine_path("/sys/class/power_supply", battery, "charge_now"));
+			int bat_charge_full = (int)Stdio.read_file(combine_path("/sys/class/power_supply", battery, "charge_full"));
+
+			if (bat_charge > bat_charge_full) {
+				bat_charge = bat_charge_full;
+			}
+
+			brightness_adjust = ((float)bat_charge / (float)bat_charge_full) * 0.5;
+
+			if (brightness_adjust < 0.1) {
+				brightness_adjust = 0.1;
+			}
+		}
+
+		sleep(1.0);
+	}
+}
+
