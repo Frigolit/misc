@@ -80,6 +80,12 @@ int main(int argc, array argv) {
 		return 1;
 	}
 
+	// Make sure ffmpeg is available
+	if (!f_nowebcam && !Process.search_path("ffmpeg")) {
+		werror("WARNING: Couldn't find \"ffmpeg\", camera support disabled\n");
+		f_nowebcam = 1;
+	}
+
 	// Find camera
 	if (!f_nowebcam) {
 		if (f_camera != "") {
@@ -136,7 +142,7 @@ int main(int argc, array argv) {
 		}
 	}
 
-	// Should be fork to background?
+	// Should we fork to background?
 	if (!f_nofork && fork()) {
 		return 0;
 	}
