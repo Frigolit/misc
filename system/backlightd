@@ -38,12 +38,15 @@ float brightness_adjust = 1.0;
 float max_brightness_cap = 0.9;
 float min_brightness_cap = 0.05;
 
+bool periodic_updates = false;
+
 int main(int argc, array argv) {
 	int f_help = Getopt.find_option(argv, "h", "help");
 	int f_nofork = Getopt.find_option(argv, "f", "foreground");
 	int f_noac = Getopt.find_option(argv, "", "no-ac");
 	int f_nobattery = Getopt.find_option(argv, "", "no-battery");
 	int f_nowebcam = Getopt.find_option(argv, "", "no-camera");
+	periodic_updates = Getopt.find_option(argv, "p", "periodic");
 
 	string f_camera = Getopt.find_option(argv, "c", "camera", UNDEFINED, "");
 
@@ -59,6 +62,7 @@ int main(int argc, array argv) {
 		write("-h|--help             Shows this help screen.\n");
 		write("-f|--foreground       Don't fork to background.\n");
 		write("-c|--camera <path>    Path to the camera video device (e.g. /dev/video0).\n");
+		write("-p|--periodic         Enable periodic updates from camera (every 5 min).\n");
 		write("   --no-ac            Don't monitor AC adapter state.\n");
 		write("   --no-battery       Don't monitor battery level.\n");
 		write("   --no-camera        Don't use a webcam to determine light levels.\n");
@@ -208,8 +212,15 @@ void camera_update_thread() {
 	object k = mtx->lock(1);
 	camera_update_running = false;
 	if (lid_input) {
-		if (!lid_closed && refresh_count < 5) {
-			queue_camera_update(pow(++refresh_count, 2));
+		if (!lid_closed) {
+			if (refresh_count < 5) {
+				// Refresh after an increasing period of time, up until a certain point
+				queue_camera_update(pow(++refresh_count, 2));
+			}
+			else if (periodic_updates) {
+				// Periodic updates enabled, update in 5 min
+				queue_camera_update(5 * 60);
+			}
 		}
 	}
 	else {
