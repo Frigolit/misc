@@ -5,8 +5,9 @@
 // Copyright (C) 2019 Frigolit.net - https://frigolit.net/
 // Licensed under the MIT license - See LICENSE for more information.
 // ==================================================================
-// This program monitors the laptop's lid switch, AC adapter and
-// battery charge and adjusts the backlight accordingly.
+// This program monitors the laptop's lid switch, brightness buttons
+// on the keyboard, AC adapter and battery charge and adjusts the
+// backlight accordingly.
 //
 // If a webcam is available it'll take a couple of snapshots to
 // determine the current light level in the room and uses that as a
@@ -14,11 +15,18 @@
 // ==================================================================
 
 #define EV_SW 0x05
+#define EV_BRIGHTNESS_DOWN 0xE0
+#define EV_BRIGHTNESS_UP 0xE1
 
 string backlight_path;
 
 string lid_input;
+string lid_input_name;
 bool lid_closed = false;
+
+string keyboard_input;
+string keyboard_input_name;
+float base_brightness = 0.0;
 
 string ac_power;
 string battery;
@@ -39,6 +47,7 @@ float max_brightness_cap = 0.9;
 float min_brightness_cap = 0.05;
 
 bool periodic_updates = false;
+int camera_frames = 10;
 
 int main(int argc, array argv) {
 	int f_help = Getopt.find_option(argv, "h", "help");
@@ -46,14 +55,17 @@ int main(int argc, array argv) {
 	int f_noac = Getopt.find_option(argv, "", "no-ac");
 	int f_nobattery = Getopt.find_option(argv, "", "no-battery");
 	int f_nowebcam = Getopt.find_option(argv, "", "no-camera");
+	int f_nolid = Getopt.find_option(argv, "", "no-lid");
+	int f_nokeyboard = Getopt.find_option(argv, "", "no-keyboard");
 	periodic_updates = Getopt.find_option(argv, "p", "periodic");
-
+	camera_frames = Getopt.find_option(argv, "", "frames", UNDEFINED, (string)camera_frames);
 	string f_camera = Getopt.find_option(argv, "c", "camera", UNDEFINED, "");
 
 	// Usage information
 	if (f_help) {
 		write("Laptop backlight auto-adjuster\n");
 		write("Copyright (C) 2019 Frigolit.net - https://frigolit.net/\n");
+		write("Licensed under the MIT license.\n");
 		write("\n");
 
 		write("Usage: %s [options]\n", basename(argv[0]));
@@ -63,8 +75,11 @@ int main(int argc, array argv) {
 		write("-f|--foreground       Don't fork to background.\n");
 		write("-c|--camera <path>    Path to the camera video device (e.g. /dev/video0).\n");
 		write("-p|--periodic         Enable periodic updates from camera (every 5 min).\n");
+		write("   --frames <N>       Amount of camera frames to skip (default 10).\n");
 		write("   --no-ac            Don't monitor AC adapter state.\n");
 		write("   --no-battery       Don't monitor battery level.\n");
+		write("   --no-lid           Don't monitor the lid switch.\n");
+		write("   --no-keyboard      Don't monitor the brightness controls.\n");
 		write("   --no-camera        Don't use a webcam to determine light levels.\n");
 		write("\n");
 
@@ -116,18 +131,26 @@ int main(int argc, array argv) {
 		}
 	}
 
-	// Find lid switch input
+	// Find input devices
 	if (Stdio.is_dir("/sys/class/input")) {
 		foreach (get_dir("/sys/class/input"), string b) {
 			string p = combine_path("/sys/class/input", b, "name");
 
 			if (Stdio.is_file(p)) {
 				string n = String.trim_all_whites(Stdio.read_file(p));
-				if (n == "Lid Switch") {
-					array evs = filter(get_dir(dirname(p)), Function.curry(glob)("event*"));
-					if (sizeof(evs) >= 1) {
+				array evs = filter(get_dir(dirname(p)), Function.curry(glob)("event*"));
+
+				if (sizeof(evs) >= 1) {
+					// Find lid switch input
+					if (!f_nolid && !lid_input && n == "Lid Switch") {
 						lid_input = evs[0];
-						break;
+						lid_input_name = n;
+					}
+
+					// Find keyboard
+					else if (!f_nokeyboard && !keyboard_input && glob("*at * keyboard*", lower_case(n))) {
+						keyboard_input = evs[0];
+						keyboard_input_name = n;
 					}
 				}
 			}
@@ -153,7 +176,8 @@ int main(int argc, array argv) {
 
 	if (f_nofork) {
 		write("Backlight:  %s\n", backlight_path);
-		write("Lid switch: %s\n", lid_input || "(none)");
+		write("Lid switch: %s\n", lid_input ? (lid_input + " (" + lid_input_name + ")") : "(none)");
+		write("Keyboard:   %s\n", keyboard_input ? (keyboard_input + " (" + keyboard_input_name + ")") : "(none)");
 		write("AC power:   %s\n", ac_power || "(none)");
 		write("Battery:    %s\n", battery || "(none)");
 		write("Webcam:     %s\n", webcam_path || "(none)");
@@ -162,6 +186,10 @@ int main(int argc, array argv) {
 
 	if (lid_input && webcam_path) {
 		Thread.Thread(lid_switch_thread);
+	}
+
+	if (keyboard_input) {
+		Thread.Thread(keyboard_thread);
 	}
 
 	if (ac_power) {
@@ -196,7 +224,7 @@ void camera_update_thread() {
 	}
 
 	Stdio.mkdirhier("/tmp/backlightd");
-	mapping m = Process.run("ffmpeg -f video4linux2 -i " + webcam_path + " -vframes 10 /tmp/backlightd/%3d.jpg");
+	mapping m = Process.run("ffmpeg -f video4linux2 -i " + webcam_path + " -vframes " + camera_frames + " /tmp/backlightd/%3d.jpg");
 
 	string fn = combine_path("/tmp/backlightd", sort(get_dir("/tmp/backlightd"))[-1]);
 
@@ -236,7 +264,7 @@ void brightness_thread() {
 	int cur_brightness = max_brightness;
 
 	while (true) {
-		float t = target_brightness * brightness_adjust;
+		float t = target_brightness * brightness_adjust + base_brightness;
 
 		if (t > max_brightness_cap) { t = max_brightness_cap; }
 		else if (t < min_brightness_cap) { t = min_brightness_cap; }
@@ -255,7 +283,7 @@ void brightness_thread() {
 			sleep(1.0 / 15.0);
 		}
 		else {
-			sleep(1.5);
+			sleep(1.0);
 		}
 	}
 }
@@ -309,6 +337,44 @@ void lid_switch_thread() {
 				queue_camera_update();
 			}
 			destruct(k);
+		}
+	}
+}
+
+void keyboard_thread() {
+	Stdio.File f = Stdio.File("/dev/input/" + keyboard_input, "r");
+	string d;
+
+	multiset active_switches = (< >);
+
+	while (d = f->read(24)) {
+		if (!d || d == "") {
+			break;
+		}
+
+		bool redraw = false;
+
+		int m_type = (d[17] << 8) | d[16];
+		int m_code = (d[19] << 8) | d[18];
+		int m_value;
+
+		sscanf(d[20..23], "%+-4c", m_value);
+
+		if (m_value) {
+			if (m_code == EV_BRIGHTNESS_DOWN) {
+				object k = mtx->lock(1);
+				if (base_brightness > -1.0) {
+					base_brightness -= 0.1;
+				}
+				destruct(k);
+			}
+			else if (m_code == EV_BRIGHTNESS_UP) {
+				object k = mtx->lock(1);
+				if (base_brightness < 1.0) {
+					base_brightness += 0.1;
+				}
+				destruct(k);
+			}
 		}
 	}
 }
