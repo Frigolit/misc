@@ -1,0 +1,203 @@
+#!/usr/bin/env pike
+
+// ssh 10.0.12.103 ffmpeg -v -8 -s 1920x1080 -r 24 -f x11grab -i :0.0+1600,0 -s 960x540 -c:v libx264 -preset superfast -b:v 8M -f matroska - | ffplay -v -8 -
+
+object proc_source;
+object proc_target;
+
+int main(int argc, array(string) argv) {
+	string f_display = Getopt.find_option(argv, "d", "display", UNDEFINED, "0.0");
+	int f_fps = (int)Getopt.find_option(argv, "f", "fps", UNDEFINED, "12");
+	string f_bandwidth = Getopt.find_option(argv, "b", "bandwidth", UNDEFINED, "1M");
+	string f_monitor = Getopt.find_option(argv, "m", "monitor", UNDEFINED, "");
+	string f_size = Getopt.find_option(argv, "s", "size", UNDEFINED, "1.0");
+
+	int f_list = Getopt.find_option(argv, "l", "list");
+
+	argv = Getopt.get_args(argv);
+
+	string f_hostname = argv[1];
+
+	if (f_monitor == "") { f_monitor = UNDEFINED; }
+
+	mapping selected_monitor;
+
+	array monitors = get_monitors(f_hostname, f_display);
+	if (!monitors) {
+		return 1;
+	}
+	else if (!sizeof(monitors)) {
+		werror("ERROR: No monitors available on remote host.\n");
+		return 1;
+	}
+
+	if (f_list) {
+		list_monitors(Stdio.stdout, monitors);
+		return 0;
+	}
+
+	if (f_monitor) {
+		foreach (monitors, mapping m) {
+			if (m->name == f_monitor) {
+				selected_monitor = m;
+				break;
+			}
+		}
+
+		if (!selected_monitor) {
+			werror("ERROR: Couldn't find the specified monitor %O.\n", f_monitor);
+			list_monitors(Stdio.stderr, monitors);
+			return 1;
+		}
+	}
+	else {
+		// Default to primary monitor
+		foreach (monitors, mapping m) {
+			if (m->is_primary) {
+				selected_monitor = m;
+				break;
+			}
+		}
+
+		// If no monitor is marked as primary, just pick the first one from the list
+		if (!selected_monitor) {
+			selected_monitor = monitors[0];
+		}
+	}
+
+	werror("Selected monitor: %s (%dx%d at %d, %d)\n", selected_monitor->name, selected_monitor->w, selected_monitor->h, selected_monitor->x, selected_monitor->y);
+
+	string screen_size = sprintf("%dx%d", selected_monitor->w, selected_monitor->h);
+	int screen_x = selected_monitor->x;
+	int screen_y = selected_monitor->y;
+
+	string output_size;
+
+	if (glob("*x*", f_size)) {
+		output_size = f_size;
+	}
+	else if (glob("*.*", f_size)) {
+		float f = (float)f_size;
+		if (f <= 0.0) {
+			werror("ERROR: Invalid value for parameter -s|--size.\n");
+			return 1;
+		}
+
+		output_size = sprintf("%dx%d", (int)ceil(selected_monitor->w * f), (int)ceil(selected_monitor->h * f));
+	}
+
+	Stdio.File f_source = Stdio.File();
+	Stdio.File p_source = f_source->pipe();
+
+	Stdio.File f_target = Stdio.File();
+	Stdio.File p_target = f_target->pipe(Stdio.PROP_REVERSE);
+
+	proc_source = Process.create_process(({ "ssh", f_hostname, "DISPLAY=:" + f_display, "ffmpeg", "-v", "-8", "-s", screen_size, "-r", (string)f_fps, "-f", "x11grab", "-i", ":" + f_display + "+" + screen_x + "," + screen_y, "-s", output_size, "-c:v", "libx264", "-preset", "superfast", "-b:v", f_bandwidth, "-f", "matroska", "-" }), ([ "stdout": p_source, "callback": cb_proc_source ]));
+	proc_target = Process.create_process(({ "ffplay", "-infbuf", "-v", "-8", "-" }), ([ "stdin": p_target, "callback": cb_proc_target ]));
+
+	Thread.Thread(data_thread, ({ f_source, f_target }));
+
+	return -1;
+}
+
+void data_thread(array m) {
+	Stdio.File f_source = m[0];
+	Stdio.File f_target = m[1];
+
+	int ts = gethrtime();
+	int t;
+	int s = 0;
+
+	while (true) {
+		string d = f_source->read(8192, 1);
+		if (!d || d == "") {
+			werror("\ndata_thread(): end of stream - terminating thread...\n");
+			return;
+		}
+
+		f_target->write(d);
+		s += sizeof(d);
+
+		t = gethrtime();
+		if (t - ts >= 1000000) {
+			ts = t;
+			write("\rRate: %12s/s", nicesize(s));
+			s = 0;
+		}
+	}
+}
+
+string nicesize(int s) {
+	if (s >= 1024 * 1024 * 1000) {
+		return sprintf("%.1f GiB", s / 1024.0 / 1024.0 / 1024.0);
+	}
+	else if (s >= 1024 * 1000) {
+		return sprintf("%.1f MiB", s / 1024.0 / 1024.0);
+	}
+	else {
+		return sprintf("%.1f KiB", s / 1024.0);
+	}
+}
+
+void cb_proc_source() {
+	if (proc_source->status() != 0) {
+		write("\nSource process lost - Terminating target process...\n");
+		proc_target->kill(15);
+		write("Exiting...\n");
+		exit(0);
+	}
+}
+
+void cb_proc_target() {
+	if (proc_target->status() != 0) {
+		write("\nTarget process lost - Terminating source process...\n");
+		proc_source->kill(15);
+		write("Exiting...\n");
+		exit(0);
+	}
+}
+
+array get_monitors(string hostname, string display) {
+	array result = ({ });
+
+	mapping m = Process.run("ssh " + hostname + " DISPLAY=:" + display + " xrandr --listmonitors");
+	if (m->exitcode) {
+		werror("ERROR: Failed enumerating monitors on remote host: %s", m->stderr);
+		return UNDEFINED;
+	}
+
+	array a = m->stdout / "\n";
+	if (!glob("Monitors: *", a[0])) {
+		werror("ERROR: Unexpected output from xrandr\n");
+		return UNDEFINED;
+	}
+
+	foreach (a[1..], string n) {
+		n = String.trim_all_whites(n);
+
+		array b = array_sscanf(n, "%d: %s %d/%*dx%d/%*d+%d+%d  %s");
+		if (sizeof(b) != 7) {
+			continue;
+		}
+
+		result += ({
+			([
+				"w": b[2],
+				"h": b[3],
+				"x": b[4],
+				"y": b[5],
+				"name": b[6],
+				"is_primary": b[1][0..1] == "+*",
+			])
+		});
+	}
+
+	return result;
+}
+
+void list_monitors(Stdio.Stream f, array(mapping) monitors) {
+	f->write("Available monitors:\n");
+	foreach (monitors, mapping m) {
+		f->write(sprintf("  [%s] %dx%d at (%d, %d)%s\n", m->name, m->w, m->h, m->x, m->y, m->is_primary ? " [PRIMARY]" : ""));
+	}
+}
