@@ -1,0 +1,349 @@
+#!/usr/bin/env pike
+
+// ======================================================================
+// ZFS information and statistics
+// Licensed under the MIT license - See LICENSE for more information
+// ======================================================================
+
+multiset(string) f_pools;
+multiset(string) f_columns;
+
+multiset(string) available_columns = (< "name", "used", "flags", "encryption", "compression" >);
+
+int main(int argc, array(string) argv) {
+	if (Getopt.find_option(argv, "h", "help")) {
+		write("Usage: %s [options] [pools]\n\n", basename(argv[0]));
+
+		write("Specify pool names to limit results to only those pools.\n\n");
+
+		write("=== Options ===\n");
+		write("-h|--help              Prints this help screen.\n");
+		write("-n <N>                 Automatically refresh every N seconds.\n");
+		write("-c|--columns <cols>    Choose which columns to display, comma-separated:\n");
+		write("                       name, used, flags, encryption, compression\n");
+
+		return 0;
+	}
+
+	int n_refresh = (int)Getopt.find_option(argv, "n", "", UNDEFINED, "0");
+
+	string n_columns = Getopt.find_option(argv, "c", "columns", UNDEFINED, "");
+	if (n_columns && sizeof(n_columns)) {
+		f_columns = (< >);
+		array a = map(n_columns / ",", String.trim_all_whites) - ({ "" });
+		foreach (a, string b) {
+			if (!available_columns[b]) {
+				werror("invalid column: %s\n", b);
+				return 1;
+			}
+
+			f_columns[b] = 1;
+		}
+	}
+	else {
+		f_columns = copy_value(available_columns);
+	}
+
+	// Get pool names if any
+	array a_pools = Getopt.get_args(argv)[1..];
+	if (sizeof(a_pools)) {
+		f_pools = (multiset)a_pools;
+	}
+
+	// Do the thing
+	if (n_refresh > 0) {
+		// Enable alternate buffer and hide cursor
+		write("\e[?1049h");
+		write("\e[?25l");
+
+		// Bind signals
+		signal(2, shutdown);
+		signal(15, shutdown);
+
+		// Start autorefresh
+		autorefresh(n_refresh);
+		return -1;
+	}
+	else {
+		refresh(false);
+	}
+}
+
+void shutdown() {
+	// Leave alternative screen buffer and show cursor
+	write("\e[?1049l");
+	write("\e[?25h");
+	exit(0);
+}
+
+void autorefresh(int interval) {
+	mixed err = catch {
+		refresh(true);
+	};
+
+	if (err) {
+		werror(describe_backtrace(err));
+	}
+
+	call_out(autorefresh, interval, interval);
+}
+
+void refresh(bool clear_screen) {
+	mapping m = get_pools();
+
+	if (clear_screen) {
+		write("\e[2J\e[1;1H");
+	}
+
+	foreach (sort(indices(m->pools)), string n) {
+		if (f_pools && !f_pools[n]) {
+			continue;
+		}
+
+		mapping pool = m->pools[n];
+
+		int heading_colour = 44;
+		string heading_extra;
+
+		if (pool->health == "ONLINE") {
+			heading_colour = 42;
+		}
+		else if (pool->health == "OFFLINE") {
+			heading_colour = 41;
+			heading_extra = "OFFLINE";
+		}
+		else if (pool->health == "DEGRADED") {
+			heading_colour = 43;
+			heading_extra = "DEGRADED";
+		}
+
+		// Print pool header
+		write("\e[%d;1m\e[K\r", heading_colour);
+
+		write(
+			"[%s] Size: %s - Free: %s (%.1f%%) - Used: %s (%.1f%%)%s\e[0m\n",
+			pool->name,
+			nicesize(pool->size),
+			nicesize(pool->free),
+			((float)pool->free / (float)pool->size) * 100.0,
+			nicesize(pool->alloc),
+			((float)pool->alloc / (float)pool->size) * 100.0,
+			heading_extra ? " - " + heading_extra : ""
+		);
+
+		// Sort datasets by name
+		array a_datasets = sort(indices(pool->datasets));
+
+		// TODO: Sorting options, below sorts datasets by size
+		//sort(map(a_datasets, pool->datasets)->refer, a_datasets);
+		//a_datasets = reverse(a_datasets);
+
+		// Calculate max dataset size
+		int max_ds_size = max(@values(pool->datasets)->refer);
+
+		// Loop through and print all datasets
+		foreach (a_datasets, string n) {
+			mapping ds = pool->datasets[n];
+
+			// Column: Name
+			if (f_columns["name"]) {
+				if (!ds->mounted && ds->type == "filesystem") {
+					// Filesystem / Not mounted
+					if (ds->mountpoint == "none") {
+						// No mountpoint
+						write("\e[33;1m");
+					}
+					else {
+						write("\e[31;1m");
+					}
+				}
+				else if (ds->type == "volume") {
+					// zvol
+					write("\e[95m");
+				}
+
+				write(
+					"%-40s\e[0m",
+					ds->name + (ds->type == "volume" ? " [zvol]" : "")
+				);
+			}
+
+			// Column: Used size
+			if (f_columns["used"]) {
+				write(
+					" | %9s [\e[31;1m%-20s\e[0m]",
+					nicesize(ds->refer),
+					"#" * (int)round(((float)ds->refer / (float)max_ds_size) * 20.0),
+				);
+			}
+
+			// Column: Flags
+			if (f_columns["flags"]) {
+				write(
+					" | %s\e[0m",
+					(
+						(ds->encryption != "off" ? "\e[32;1mE" : "\e[30;1m-")
+						+ (ds->compression != "off" ? "\e[32;1mC" : "\e[30;1m-")
+						+ (ds->dedup != "off" ? "\e[32;1mD" : "\e[30;1m-")
+					)
+				);
+			}
+
+			// Column: Encryption
+			if (f_columns["encryption"]) {
+				if (ds->encryption != "off") {
+					if (ds->keystatus == "available") {
+						write(" | \e[32;1mUnlocked\e[0m");
+					}
+					else {
+						write(" | \e[31;1mLocked\e[0m  ");
+					}
+				}
+				else {
+					write(" | \e[30;1m---\e[0m     ");
+				}
+			}
+
+			// Column: Compression
+			if (f_columns["compression"]) {
+				if (ds->compression != "off") {
+					write(" | \e[32;1m%-6s\e[0m \e[30;1m: \e[32;1m%5.2f\e[0m", ds->compression, ds->compressratio);
+				}
+				else {
+					write(" | \e[30;1m---\e[0m    \e[30;1m:   ---\e[0m");
+				}
+			}
+
+			write("\n");
+		}
+
+		write("\n");
+	}
+}
+
+mapping get_pools() {
+	mapping r = ([
+		"pools": ([ ]),
+		"datasets": ([ ]),
+	]);
+
+	mapping m;
+	array(string) lines;
+
+	// List pools
+	m = Process.run("zpool list -HPvp -o name,size,allocated,free,fragmentation,leaked,expandsize,health,dedupratio");
+	lines = (m->stdout / "\n") - ({ "" });
+
+	mapping cur_pool;
+
+	foreach (lines, string l) {
+		array a = l / "\t";
+
+		if (sizeof(a) < 9) {
+			continue;
+		}
+
+		bool is_vdev = (a[0] == "");
+
+		if (is_vdev) {
+			a = a[1..];
+		}
+
+		string m_name = a[0];
+		int m_size = (int)a[1];
+		int m_alloc = (int)a[2];
+		int m_free = (int)a[3];
+		int m_frag = (int)a[4];
+		int m_leaked = (int)a[5];
+		int m_expandsz = (int)a[6];
+		string m_health = a[7];
+		float m_dedupratio = (float)a[8];
+
+		if (is_vdev) {
+			// TODO
+			// cur_pool->vdevs[...] ...
+		}
+		else {
+			cur_pool = r->pools[m_name] = ([
+				"name": m_name,
+				"size": m_size,
+				"alloc": m_alloc,
+				"free": m_free,
+				"frag": m_frag,
+				"leaked": m_leaked,
+				"expandsz": m_expandsz,
+				"health": m_health,
+				"dedupratio": m_dedupratio,
+				"datasets": ([ ]),
+			]);
+		}
+	}
+
+	cur_pool = UNDEFINED;
+
+	// List ZFS datasets
+	m = Process.run("zfs list -Hp -o name,type,refer,available,compression,compressratio,dedup,encryption,keystatus,logicalreferenced,mounted,mountpoint");
+	lines = (m->stdout / "\n") - ({ "" });
+
+	foreach (lines, string l) {
+		array a = l / "\t";
+
+		string m_name = a[0];
+		string m_type = a[1];
+		int m_refer = (int)a[2];
+		int m_avail = (int)a[3];
+		string m_compression = a[4];
+		float m_compressratio = (float)a[5];
+		string m_dedup = a[6];
+		string m_encryption = a[7];
+		string m_keystatus = a[8];
+		int m_logicalreferenced = (int)a[9];
+		bool m_mounted = a[10] == "yes";
+		string m_mountpoint = a[11];
+
+		string m_pool = (m_name / "/")[0];
+		if (!r->pools[m_pool]) {
+			continue;
+		}
+
+		mapping ds = ([
+			"pool_name": m_pool,
+			"name": m_name,
+			"type": m_type,
+			"refer": m_refer,
+			"avail": m_avail,
+			"compression": m_compression,
+			"compressratio": m_compressratio,
+			"dedup": m_dedup,
+			"encryption": m_encryption,
+			"keystatus": m_keystatus,
+			"logicalreferenced": m_logicalreferenced,
+			"mounted": m_mounted,
+			"mountpoint": m_mountpoint,
+		]);
+
+		r->datasets[m_name] = ds;
+		r->pools[m_pool]->datasets[m_name] = ds;
+	}
+
+	// Done
+	return r;
+}
+
+string nicesize(int|float s) {
+	if (s >= 1024 * 1024 * 1024 * 1024 * 1000) {
+		return sprintf("%.1f PiB", s / 1024.0 / 1024.0 / 1024.0 / 1024.0 / 1024.0);
+	}
+	else if (s >= 1024 * 1024 * 1024 * 1000) {
+		return sprintf("%.1f TiB", s / 1024.0 / 1024.0 / 1024.0 / 1024.0);
+	}
+	else if (s >= 1024 * 1024 * 1000) {
+		return sprintf("%.1f GiB", s / 1024.0 / 1024.0 / 1024.0);
+	}
+	else if (s >= 1024 * 1000) {
+		return sprintf("%.1f MiB", s / 1024.0 / 1024.0);
+	}
+	else {
+		return sprintf("%.1f KiB", s / 1024.0);
+	}
+}
